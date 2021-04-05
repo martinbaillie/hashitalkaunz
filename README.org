@@ -1,0 +1,494 @@
+#+TITLE:  Hashitalk ANZ: Ephemeral GitHub Tokens via Vault
+#+AUTHOR: Martin Baillie
+#+EMAIL:  martin@baillie.id / @martinbaillie
+* Agenda
+
+** Motivation
+** Vault GitHub Plugin
+** Demo
+** Questions
+* GitHub's Automation Story
+Typically starts with [[https://github.com/settings/apps][Personal Access Tokens (PATs)]]
+
+** [[https://docs.github.com/en/developers/apps/scopes-for-oauth-apps][Coarsely-scoped permissions]]
+** PATs do _not expire_
+** Tied to a user account lifecycle
+** Organisations usually need a CI/CD user
+* GitHub Apps
+Have a better automation story.
+
+** [[https://docs.github.com/en/rest/reference/permissions-required-for-github-apps][Much finer-scoped permissions]]
+** App installation tokens expire after _1 hour_
+** Installed into one (or many) Organisations
+** Do not consume a user seat (license)
+* GitHub Apps
+Have a better automation story, but are more awkward.
+
+** Sensitive private keys
+** Relatively complex [[https://developer.github.com/apps/building-github-apps/authenticating-with-github-apps/#authenticating-as-an-installation][token request flow]]
+* Introducing the Vault GitHub Plugin
+GitHub meet Vault!
+
+** Architecture
+#+ATTR_ORG: :width 1024
+[[file:vault_github_plugin.png]]
+Source: [[https://martin.baillie.id/wrote/ephemeral-github-tokens-via-hashicorp-vault/][Ephemeral GitHub Tokens via HashiCorp Vault]] blog post.
+
+* Demo
+
+[[file:demo_cat.png]]
+* 1. Get the Vault GitHub Plugin
+First things first.
+[[https://github.com/martinbaillie/vault-plugin-secrets-github][github.com/martinbaillie/vault-plugin-secrets-github]]
+
+** Option 1: Compile locally for your OS and arch.
+
+Check out the repo [[file:~/Code/personal/vault-plugin-secrets-github/Makefile][Makefile]] (or run =make help=). Example:
+#+begin_src shell :exports both
+make vault-plugin-secrets-github-linux-amd64
+#+end_src
+
+** Option 2: Download the latest [[https://github.com/martinbaillie/vault-plugin-secrets-github/releases][GitHub release]].
+
+But don't forget to:
+*** Verify Authenticity (see my [[https://github.com/martinbaillie.gpg][GPG public key]])
+#+BEGIN_SRC shell :exports both :results verbatim
+gpg --verify SHA256SUMS.sig SHA256SUMS 2>&1
+#+END_SRC
+
+#+RESULTS:
+: gpg: Signature made Sat 20 Feb 2021 16:56:10 AEDT
+: gpg:                using RSA key C2F079DED64B7361006AA0992A56EA64591E15E4
+: gpg: Good signature from "Martin Baillie <martin@baillie.id>" [ultimate]
+: gpg:                 aka "Martin Baillie <martin.t.baillie@gmail.com>" [ultimate]
+: gpg:                 aka "Martin Baillie (Tyro) <mbaillie@tyro.com>" [ultimate]
+
+*** Verify Integrity
+#+begin_src shell :exports both
+shasum --ignore-missing -a 256 -c SHA256SUMS
+#+end_src
+
+#+RESULTS:
+: vault-plugin-secrets-github-linux-amd64: OK
+
+* 2. Configure the GitHub App
+
+** Unidirectional (Vault --> GitHub) use case
+** No need for public Vault access
+** Gather 3 things from the GitHub App:
+  1. Application ID
+  2. Private key (generated)
+  3. Installation ID
+
+#+begin_quote
+NOTE: These are all needed to configure the Vault plugin.
+#+end_quote
+
+[[https://github.com/settings/apps][We will configure a demo GitHub App on my profile.]]
+
+* 3. Start a Demoware Vault Instance
+To install the plugin.
+
+** Layout a plugin directory
+So Vault can discover and register the plugin for us.
+
+#+begin_src shell :exports both :results verbatim
+mkdir -p plugins
+cp vault-plugin-secrets-github-linux-amd64 plugins
+tree plugins
+#+end_src
+
+#+RESULTS:
+: plugins
+: └── vault-plugin-secrets-github-linux-amd64
+:
+: 0 directories, 1 file
+
+** Run development Vault instance
+We'll run this on localhost and keep it in the foreground.
+
+#+begin_src shell :exports both
+vault server \
+	-dev \
+	-dev-plugin-dir="${PWD}/plugins" \
+	-dev-root-token-id=root \
+	-log-level=debug
+#+end_src
+
+** Confirm availability
+Test the instance is running.
+#+begin_src shell :exports both
+vault status | grep '^Version\|^Sealed'
+#+end_src
+
+#+RESULTS:
+| Sealed  | false |
+| Version | 1.7.0 |
+
+And can be accessed as root.
+#+begin_src shell :exports both
+vault token lookup | grep '^id\|^policies'
+#+end_src
+
+#+RESULTS:
+| id       | root   |
+| policies | [root] |
+
+* 4. Enable the Vault GitHub Plugin
+#+begin_quote
+NOTE: You may need to pre-register it with the instance's plugin catalog.
+#+end_quote
+
+Mount it at =github/=
+#+begin_src shell :exports both
+vault secrets enable \
+    -path=github \
+    -plugin-name="$(ls plugins)" \
+    plugin
+#+end_src
+
+#+RESULTS:
+: Success! Enabled the vault-plugin-secrets-github-linux-amd64 secrets engine at: github/
+
+Confirm using the plugin =info= endpoint.
+#+begin_src shell :exports both :results verbatim
+vault read github/info
+#+end_src
+
+#+RESULTS:
+: Key               Value
+: ---               -----
+: build_branch      master
+: build_date        Sat Feb 20 16:02:00 AEDT 2021
+: build_revision    006d127
+: build_user        Martin Baillie
+: build_version     1.1.0
+: project_docs      https://github.com/martinbaillie/vault-plugin-secrets-github
+: project_name      vault-plugin-secrets-github
+
+* 5. Configure the Vault GitHub Plugin
+Using the information gathered previously.
+
+#+begin_src shell :exports both
+vault write github/config \
+	app_id=108611 \
+	ins_id=15983726 \
+	prv_key=@private_key.pem
+#+end_src
+
+#+RESULTS:
+: Success! Data written to: github/config
+
+Optionally confirm by reading the config back.
+#+begin_src shell :exports both
+vault read github/config
+#+end_src
+
+#+RESULTS:
+| Key      | Value                  |
+| ---      | -----                  |
+| app_id   | 108611                 |
+| base_url | https://api.github.com |
+| ins_id   | 15983726               |
+
+#+begin_quote
+NOTE: Private key is not echoed back for security reasons.
+#+end_quote
+* 6. Create a GitHub Token
+Kick the tyres.
+
+#+begin_src shell :exports both :results verbatim
+vault read github/token
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Key                          Value
+---                          -----
+lease_id                     github/token/lMdBSrOnAuxJ7kY8aKknpJT6
+lease_duration               59m59s
+lease_renewable              false
+expires_at                   2021-04-22T09:14:16Z
+has_multiple_single_files    false
+permissions                  map[contents:read deployments:read metadata:read pull_requests:write single_file:read]
+repository_selection         selected
+single_file                  demo_file
+single_file_paths            [demo_file]
+token                        ghs_AfR2UeL0HhRssp97dtd2WHhfCmYdRh1Cm44e
+#+end_example
+
+This unconstrained token:
+- has access to the _same superset_ of permissions the GitHub App has
+- expires in 1 hour
+
+* 7. Use the GitHub Token
+#+NAME: github_token
+#+BEGIN_SRC shell :exports none :cache yes
+vault read -field token github/token
+#+END_SRC
+
+#+RESULTS[7a90d0c41060ce327c89de67321acda6034c8408]: github_token
+: ghs_pV7jNIUHtBABFtCijIXfICYWyDcS8J18tGr7
+
+** Example: Git operations
+Clone this private =hashitalkaunz= repository. This should not work!
+#+begin_example
+git clone https://github.com/martinbaillie/hashitalkaunz.git
+#+end_example
+
+Use the previously created token to clone the private repository.
+#+begin_src shell :exports both :results drawer :var GITHUB_TOKEN=github_token
+echo git clone \
+    https://x-access-token:${GITHUB_TOKEN}@github.com/martinbaillie/hashitalkaunz.git \
+	$(mktemp -d)
+#+end_src
+
+#+RESULTS:
+:results:
+git clone https://x-access-token:ghs_pV7jNIUHtBABFtCijIXfICYWyDcS8J18tGr7@github.com/martinbaillie/hashitalkaunz.git /tmp/tmp.0uOyvkQfsF
+:end:
+
+** Example: GitHub API operations
+Use the API to get file contents from a private repository.
+#+begin_src shell :exports both :var GITHUB_TOKEN=github_token
+curl --header 'Authorization: token '${GITHUB_TOKEN}'' \
+	--header 'Accept: application/vnd.github.v3.raw' \
+	https://api.github.com/repos/martinbaillie/hashitalkaunz/contents/demo_file
+#+end_src
+
+#+RESULTS:
+: This is the contents of a file in a private repo.
+
+* 8. Leases
+GitHub App tokens last for one hour.
+
+However, each issued via the plugin also gets a *Vault lease*!
+#+begin_src shell :exports both
+vault list sys/leases/lookup/github/token
+#+end_src
+
+#+RESULTS:
+| Keys                     |
+| ----                     |
+| 4ropF4SEq6UjT00zNFEgDGxW |
+| lMdBSrOnAuxJ7kY8aKknpJT6 |
+
+The leases are also found in the [[http://localhost:8200/ui/vault/access/leases/list/github/token/][Vault UI]].
+
+** Revocation
+You can revoke tokens earlier than 1 hour using Vault's lease semantics.
+
+#+begin_quote
+NOTE: You can even force revoke *_ALL_* tokens managed by Vault in one shot.
+#+end_quote
+
+Let's play that out using the UI.
+#+begin_src shell :exports both :results verbatim :var GITHUB_TOKEN=github_token
+curl -sSH 'Authorization: token '${GITHUB_TOKEN}'' \
+	https://api.github.com/apps/demovaultplugin |
+	jq -r 'with_entries(select(.key|match("permissions+","message+"; "ig")))'
+#+end_src
+
+#+RESULTS:
+: {
+:   "message": "Bad credentials"
+: }
+
+* 9. Client-constrained Tokens
+It is possible to further constrain the GitHub token as a client.
+#+NAME: github_token_constrained
+#+BEGIN_SRC shell :exports none :cache yes
+vault write -field token github/token permissions=single_file=read
+#+END_SRC
+
+#+RESULTS[3a12049b98c94e0cca18e4f8d5c276e357df1f75]: github_token_constrained
+: ghs_vBczJyTe7LhUmSOOwOllGZOhM1OTuX0eniv6
+
+** Client-constrained example: GitHub API operations
+Use the API to get file contents from a private repository.
+#+begin_src shell :exports both :var GITHUB_TOKEN=github_token_constrained
+curl --header 'Authorization: token '${GITHUB_TOKEN}'' \
+	--header 'Accept: application/vnd.github.v3.raw' \
+	https://api.github.com/repos/martinbaillie/hashitalkaunz/contents/demo_file
+#+end_src
+
+#+RESULTS:
+: This is the contents of a file in a private repo.
+
+** Client-constrained example: Git operations
+Use the token to clone a private repository.
+#+begin_src shell :exports both :results drawer :var GITHUB_TOKEN=github_token_constrained
+echo git clone \
+	https://x-access-token:${GITHUB_TOKEN}@github.com/martinbaillie/hashitalkaunz.git \
+	$(mktemp -d)
+#+end_src
+
+#+RESULTS:
+:results:
+git clone https://x-access-token:ghs_vBczJyTe7LhUmSOOwOllGZOhM1OTuX0eniv6@github.com/martinbaillie/hashitalkaunz.git /tmp/tmp.dBhu0D2SCo
+:end:
+
+* 10. Policy Restrictions
+Use Vault's powerful RBAC to restrict usage patterns.
+#+begin_src shell :exports both
+vault policy write github-only-prs - <<EOF
+path "github/token" {
+  capabilities = ["update"]
+  required_parameters = ["permissions","repository_ids"]
+  allowed_parameters = {
+    "repository_ids" = ["354736468"]
+    "permissions"= ["pull_requests=write"]
+  }
+}
+EOF
+#+end_src
+
+#+RESULTS:
+: Success! Uploaded policy: github-only-prs
+
+Enforce behaviour by assigning the [[http://localhost:8200/ui/vault/policy/acl/github-only-prs][github-only-prs policy]] to users or groups.
+#+begin_src shell :exports both :results verbatim
+vault auth enable userpass
+vault write auth/userpass/users/martin password=baillie policies="github-only-prs"
+#+end_src
+
+#+RESULTS:
+: Success! Enabled userpass auth method at: userpass/
+: Success! Data written to: auth/userpass/users/martin
+
+User =martin= can now only make requests to the plugin that conform to policy.
+#+begin_example shell
+# OK:
+vault write github/token repository_ids=354736468 permissions=pull_requests=write
+
+# Denied:
+vault read github/token
+vault write github/token permissions=pull_requests=write
+vault write github/token repository_ids=354736468 permissions=metadata=read
+vault write github/token repository_ids=123 permissions=pull_requests=write
+vault write github/token repository_ids=354736468
+#+end_example
+
+* 11. Server-constrained Tokens (Permission Sets)
+Even better, the plugin can automatically constrain tokens!
+
+Create a new "permission set".
+#+begin_src shell :exports both
+vault write github/permissionset/demo-set permissions=single_file=read
+#+end_src
+
+#+RESULTS:
+: Success! Data written to: github/permissionset/demo-set
+
+Create a new token using the permission set.
+#+NAME: github_token_permission_set
+#+BEGIN_SRC shell :exports none :cache yes
+vault read -field token github/token/demo-set
+#+END_SRC
+
+#+RESULTS[c2883c07a4355e0932de1681355d916e2e147097]: github_token_permission_set
+: ghs_0HwFQvXPaPgqIQZbANT5T0GgniDJyT3ADmjm
+
+** Permission Set example: GitHub API operations
+Use the API to get file contents from a private repository.
+#+begin_src shell :exports both :var GITHUB_TOKEN=github_token_permission_set
+curl --header 'Authorization: token '${GITHUB_TOKEN}'' \
+	--header 'Accept: application/vnd.github.v3.raw' \
+	https://api.github.com/repos/martinbaillie/hashitalkaunz/contents/demo_file
+#+end_src
+
+#+RESULTS:
+: This is the contents of a file in a private repo.
+
+** Permission Set example: Git operations
+Use the token to clone a private repository.
+#+begin_src shell :exports both :results drawer :var GITHUB_TOKEN=github_token_permission_set
+echo git clone \
+	https://x-access-token:${GITHUB_TOKEN}@github.com/martinbaillie/hashitalkaunz.git \
+	$(mktemp -d)
+#+end_src
+
+#+RESULTS:
+:results:
+git clone https://x-access-token:ghs_0HwFQvXPaPgqIQZbANT5T0GgniDJyT3ADmjm@github.com/martinbaillie/hashitalkaunz.git /tmp/tmp.1lNbnWCbKR
+:end:
+
+** Again, enforce with policy
+#+BEGIN_SRC shell :exports both :results verbatim
+vault policy write github-demo-set - <<EOF
+path "github/token/demo-set" {
+  capabilities = ["update"]
+}
+EOF
+vault write auth/userpass/users/martin policies="github-demo-set"
+#+end_src
+
+#+RESULTS:
+: Success! Uploaded policy: github-demo-set
+: Success! Data written to: auth/userpass/users/martin
+
+User =martin= now:
+- Does not need to think about GitHub permissions in his request.
+- Can only get =github/token/demo-set= permission set constrained tokens.
+
+* 12. Metrics
+Are available in OpenMetrics/Prometheus exposition format.
+
+#+begin_src shell :exports both :results verbatim
+curl -k ${VAULT_ADDR}/v1/github/metrics | grep "^vault"
+#+end_src
+
+#+RESULTS:
+#+begin_example
+vault_github_token_build_info{branch="master",goversion="go1.15.8",revision="006d127",version="1.1.0"} 1
+vault_github_token_request_duration_seconds{permissions="false",repository_ids="false",success="true",quantile="0.5"} 0.256390984
+vault_github_token_request_duration_seconds{permissions="false",repository_ids="false",success="true",quantile="0.9"} 0.349425948
+vault_github_token_request_duration_seconds{permissions="false",repository_ids="false",success="true",quantile="0.99"} 0.349425948
+vault_github_token_request_duration_seconds_sum{permissions="false",repository_ids="false",success="true"} 0.605816932
+vault_github_token_request_duration_seconds_count{permissions="false",repository_ids="false",success="true"} 2
+vault_github_token_request_duration_seconds{permissions="true",repository_ids="false",success="true",quantile="0.5"} 0.303974524
+vault_github_token_request_duration_seconds{permissions="true",repository_ids="false",success="true",quantile="0.9"} 0.312938733
+vault_github_token_request_duration_seconds{permissions="true",repository_ids="false",success="true",quantile="0.99"} 0.312938733
+vault_github_token_request_duration_seconds_sum{permissions="true",repository_ids="false",success="true"} 0.91452633
+vault_github_token_request_duration_seconds_count{permissions="true",repository_ids="false",success="true"} 3
+vault_github_token_revocation_request_duration_seconds{success="true",quantile="0.5"} 0.286065713
+vault_github_token_revocation_request_duration_seconds{success="true",quantile="0.9"} 0.319137279
+vault_github_token_revocation_request_duration_seconds{success="true",quantile="0.99"} 0.319137279
+vault_github_token_revocation_request_duration_seconds_sum{success="true"} 0.8862420819999999
+vault_github_token_revocation_request_duration_seconds_count{success="true"} 3
+#+end_example
+
+** Dashboard
+Sample Grafana [[file:~/Code/personal/vault-plugin-secrets-github/dashboard.json][dashboard]] also available.
+
+#+ATTR_ORG: :width 1280
+[[file:dashboard.png]]
+
+* 13. Bonus: Git Remote Helpers
+If one were so inclined, they could write a [[https://git-scm.com/docs/gitremote-helpers][Git Remote Helper]].
+
+Git remote operations using a custom Vault-aware protocol e.g.
+=git clone vault://...=
+
+Proof of concept:
+#+begin_src bash :tangle git-remote-vault :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+set -eou pipefail
+
+remote=$1
+target=$2
+
+repo=$(sed -e 's#^vault://##' <<< "${target}")
+echo >&2 "[VAULT] Provisioning ephemeral GitHub token for ${repo}..."
+
+json=$(vault read -format json github/token permissions=contents=read)
+token=$(jq -r '.data.token' <<< "${json}")
+lease=$(jq -r '.lease_id' <<< "${json}")
+
+git remote-https $1 "https://x-access-token:${token}@${repo}"
+
+echo >&2 "[VAULT] Revoking ephemeral GitHub token..."
+vault lease revoke "${lease}"
+#+end_src
+
+* Questions

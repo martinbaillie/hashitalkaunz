@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -eou pipefail
+
+remote=$1
+target=$2
+
+repo=$(sed -e 's#^vault://##' <<< "${target}")
+echo >&2 "[VAULT] Provisioning ephemeral GitHub token for ${repo}..."
+
+json=$(vault read -format json github/token permissions=contents=read)
+token=$(jq -r '.data.token' <<< "${json}")
+lease=$(jq -r '.lease_id' <<< "${json}")
+
+git remote-https $1 "https://x-access-token:${token}@${repo}"
+
+echo >&2 "[VAULT] Revoking ephemeral GitHub token..."
+vault lease revoke "${lease}"
